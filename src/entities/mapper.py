@@ -123,6 +123,12 @@ class Mapper(object):
         iteration = 0
         losses_dict = {}
 
+        densify = self.config.get("densify", False)
+        densify_interval = self.config.get("densify_interval", 50)
+        densify_grad_threshold = self.config.get("densify_grad_threshold", 0.0002)
+        densify_min_opacity = self.config.get("densify_min_opacity", 0.05)
+        densify_extent = self.config.get("densify_extent", 1.0)
+
         current_frame_iters = self.current_view_opt_iterations * iterations
         distribution = compute_opt_views_distribution(len(keyframes), iterations, current_frame_iters)
         start_time = time.time()
@@ -153,6 +159,18 @@ class Mapper(object):
                                      "total_loss": total_loss.item()}
 
             with torch.no_grad():
+                # Densification: track gradients and periodically split/clone
+                if densify and iteration < iterations:
+                    radii = render_pkg["radii"]
+                    means2D = render_pkg["means2D"]
+                    visibility_filter = radii > 0
+                    gaussian_model.max_radii2D[visibility_filter] = torch.max(
+                        gaussian_model.max_radii2D[visibility_filter], radii[visibility_filter])
+                    gaussian_model.add_densification_stats(means2D, visibility_filter)
+
+                    if iteration > 0 and iteration % densify_interval == 0:
+                        gaussian_model.densify_and_prune(
+                            densify_grad_threshold, densify_min_opacity, densify_extent)
 
                 if iteration == iterations // 2 or iteration == iterations:
                     prune_mask = (gaussian_model.get_opacity()
@@ -196,8 +214,9 @@ class Mapper(object):
             if filter_cloud:
                 cloud_to_add, _ = cloud_to_add.remove_statistical_outlier(nb_neighbors=40, std_ratio=2.0)
             gaussian_model.add_points(cloud_to_add)
-        gaussian_model._features_dc.requires_grad = False
-        gaussian_model._features_rest.requires_grad = False
+        # Keep color features trainable for multi-view optimization
+        gaussian_model._features_dc.requires_grad = True
+        gaussian_model._features_rest.requires_grad = True
         print("Gaussian model size", gaussian_model.get_size())
         return new_pts_ids.shape[0]
 

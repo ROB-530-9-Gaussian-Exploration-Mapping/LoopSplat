@@ -2,6 +2,8 @@
 from pathlib import Path
 from typing import Union
 
+import matplotlib
+matplotlib.rcParams['text.usetex'] = False
 import matplotlib.pyplot as plt
 import numpy as np
 import torch
@@ -76,6 +78,7 @@ class Logger(object):
                        "Mapping/depth_loss": opt_dict[frame_id]["depth_loss"]})
 
     def vis_mapping_iteration(self, frame_id, iter, color, depth, gt_color, gt_depth, seeding_mask=None, interval=10) -> None:
+        return  # Skip visualization (matplotlib font issue on this system)
         """
         Visualization of depth, color images and save to file.
 
@@ -145,12 +148,11 @@ class Logger(object):
 
         for ax in axs.flatten():
             ax.axis('off')
-        fig.tight_layout()
-        plt.subplots_adjust(top=0.90)  # Adjust top margin
         fig_name = str(self.output_path / "mapping_vis" / f'{frame_id:04d}_{iter:04d}.jpg')
-        fig_title = f"Mapper Color/Depth at frame {frame_id:04d} iters {iter:04d}"
-        plt.suptitle(fig_title, y=0.98, fontsize=20)
-        plt.savefig(fig_name, dpi=250, bbox_inches='tight')
+        try:
+            fig.savefig(fig_name, dpi=250)
+        except Exception:
+            print(f"Warning: could not save mapping vis for frame {frame_id}")
         plt.clf()
         plt.close()
         if self.use_wandb:

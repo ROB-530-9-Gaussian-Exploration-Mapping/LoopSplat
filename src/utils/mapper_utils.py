@@ -208,7 +208,11 @@ def compute_new_points_ids(frustum_points: torch.Tensor, new_pts: torch.Tensor,
     if device == "cpu":
         pts_index = faiss.IndexFlatL2(3)
     else:
-        pts_index = faiss.index_cpu_to_gpu(faiss.StandardGpuResources(), 0, faiss.IndexFlatL2(3))
+        try:
+            pts_index = faiss.index_cpu_to_gpu(faiss.StandardGpuResources(), 0, faiss.IndexFlatL2(3))
+        except AttributeError:
+            pts_index = faiss.IndexFlatL2(3)
+            device = "cpu"
     frustum_points = frustum_points.to(device)
     new_pts = new_pts.to(device)
     pts_index.add(frustum_points)
