@@ -214,9 +214,10 @@ class Mapper(object):
             if filter_cloud:
                 cloud_to_add, _ = cloud_to_add.remove_statistical_outlier(nb_neighbors=40, std_ratio=2.0)
             gaussian_model.add_points(cloud_to_add)
-        # Keep color features trainable for multi-view optimization
-        gaussian_model._features_dc.requires_grad = True
-        gaussian_model._features_rest.requires_grad = True
+        # Keep color features trainable unless freeze_colors is set (vanilla mode)
+        freeze = self.config.get("freeze_colors", False)
+        gaussian_model._features_dc.requires_grad = not freeze
+        gaussian_model._features_rest.requires_grad = not freeze
         print("Gaussian model size", gaussian_model.get_size())
         return new_pts_ids.shape[0]
 
