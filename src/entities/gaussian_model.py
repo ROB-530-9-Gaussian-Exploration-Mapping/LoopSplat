@@ -139,7 +139,8 @@ class GaussianModel:
             dist2 = dist2[self.get_size():]
         else:
             dist2 = torch.clamp_min(distCUDA2(torch.from_numpy(np.asarray(pcd.points)).float().cuda()), 0.0000001)
-        scales = torch.log(3.0 * torch.sqrt(dist2))[..., None].repeat(1, 3)
+        scale_mult = self.config.get("scale_multiplier", 3.0) if hasattr(self, 'config') else 3.0
+        scales = torch.log(scale_mult * torch.sqrt(dist2))[..., None].repeat(1, 3)
         rots = torch.zeros((fused_point_cloud.shape[0], 4), device="cuda")
         rots[:, 0] = 1
         opacities = inverse_sigmoid(0.5 * torch.ones((fused_point_cloud.shape[0], 1), dtype=torch.float, device="cuda"))
