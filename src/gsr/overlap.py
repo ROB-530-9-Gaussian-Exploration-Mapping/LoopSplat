@@ -48,18 +48,22 @@ def compute_overlap_gaussians(src_gs, tgt_gs, threshold=0.03):
     """
     src_tensor = src_gs.get_xyz().detach()
     tgt_tensor = tgt_gs.get_xyz().detach()
-    cpu_index = faiss.IndexFlatL2(3)
-    gpu_index = faiss.index_cpu_to_all_gpus(cpu_index)
-    gpu_index.add(tgt_tensor)
-    
-    distances, _ = batch_search_faiss(gpu_index, src_tensor, 1)
+
+    def _make_index(points):
+        index = faiss.IndexFlatL2(3)
+        try:
+            index = faiss.index_cpu_to_all_gpus(index)
+            index.add(points)
+        except (NameError, RuntimeError, AttributeError):
+            index.add(points.cpu().numpy())
+        return index
+
+    tgt_index = _make_index(tgt_tensor)
+    distances, _ = batch_search_faiss(tgt_index, src_tensor, 1)
     mask_src = distances < threshold
-    
-    cpu_index = faiss.IndexFlatL2(3)
-    gpu_index = faiss.index_cpu_to_all_gpus(cpu_index)
-    gpu_index.add(src_tensor)
-    
-    distances, _ = batch_search_faiss(gpu_index, tgt_tensor, 1)
+
+    src_index = _make_index(src_tensor)
+    distances, _ = batch_search_faiss(src_index, tgt_tensor, 1)
     mask_tgt = distances < threshold
     
     faiss_overlap_ratio = min(mask_src.sum()/len(mask_src), mask_tgt.sum()/len(mask_tgt))

@@ -201,7 +201,9 @@ def batch_search_faiss(indexer, query_points, k):
     distances_list, ids_list = [], []
 
     for split_p in split_pos:
-        distance, id = indexer.search(split_p.float(), k)
+        distance, id = indexer.search(np.ascontiguousarray(split_p.float().cpu().numpy()), k)
+        distance = torch.from_numpy(distance.copy())
+        id = torch.from_numpy(id.copy())
         distances_list.append(distance.clone())
         ids_list.append(id.clone())
     distances = torch.cat(distances_list, dim=0)
