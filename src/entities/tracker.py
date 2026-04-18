@@ -42,6 +42,7 @@ class Tracker(object):
         self.opt = OptimizationParams(ArgumentParser(description="Training script parameters"))
         self.frame_depth_loss = []
         self.frame_color_loss = []
+        self.last_pose_std_m = 0.0  # pose stability from last track() call (meters)
         self.odometry_type = self.config["odometry_type"]
         self.help_camera_initialization = self.config["help_camera_initialization"]
         self.init_err_ratio = self.config["init_err_ratio"]
@@ -160,6 +161,9 @@ class Tracker(object):
         current_min_loss = float("inf")
 
         print(f"\nTracking frame {frame_id}")
+        # For finite-difference Hessian estimation at convergence
+        param_trail = []  # list of 7-dim params (quat[4] + trans[3])
+        grad_trail = []   # list of 7-dim gradients
         # Initial loss check
         color_loss, depth_loss, _, _, _ = self.compute_losses(gaussian_model, render_settings, opt_cam_rot,
                                                               opt_cam_trans, gt_color, gt_depth, depth_mask, 
@@ -189,6 +193,17 @@ class Tracker(object):
 
             total_loss = (self.w_color_loss * color_loss + (1 - self.w_color_loss) * depth_loss)
             total_loss.backward()
+
+            # Record param + gradient during last 12 iterations for Hessian estimation
+            if iter >= num_iters - 12:
+                with torch.no_grad():
+                    theta = torch.cat([opt_cam_rot.detach().flatten(),
+                                       opt_cam_trans.detach().flatten()]).cpu().numpy().copy()
+                    grad = torch.cat([opt_cam_rot.grad.detach().flatten(),
+                                      opt_cam_trans.grad.detach().flatten()]).cpu().numpy().copy()
+                    param_trail.append(theta)
+                    grad_trail.append(grad)
+
             gaussian_model.optimizer.step()
             # gaussian_model.scheduler.step(total_loss, epoch=iter)
             gaussian_model.optimizer.zero_grad(set_to_none=True)
@@ -222,6 +237,31 @@ class Tracker(object):
                     self.logger.log_tracking_iteration(
                         frame_id, cur_cam, gt_quat, gt_trans, total_loss, color_loss, depth_loss, iter, num_iters,
                         wandb_output=False, print_output=True)
+
+        # Estimate translation uncertainty via finite-difference Hessian.
+        # Near the minimum, L ≈ 0.5 (θ-θ*)^T H (θ-θ*), so Δg = H Δθ.
+        # Given pairs (Δθ_i, Δg_i) from consecutive iterations we solve for H,
+        # invert to get covariance, and extract the translation block.
+        self.last_pose_std_m = 0.0
+        if len(param_trail) >= 4:
+            P = np.array(param_trail)  # (K, 7)
+            G = np.array(grad_trail)   # (K, 7)
+            dP = np.diff(P, axis=0)    # (K-1, 7)
+            dG = np.diff(G, axis=0)    # (K-1, 7)
+            # Solve H dP^T = dG^T  →  H = dG^T @ pinv(dP^T) via least squares
+            try:
+                H, *_ = np.linalg.lstsq(dP, dG, rcond=None)  # H is (7, 7), satisfies dP @ H = dG
+                H = 0.5 * (H + H.T)  # symmetrize
+                # Translation block (last 3 params are trans)
+                H_trans = H[4:, 4:]
+                # Regularize & invert to get covariance
+                H_trans = H_trans + 1e-6 * np.eye(3)
+                cov_trans = np.linalg.inv(H_trans)
+                # Scalar: RMS position std (sqrt of mean diagonal)
+                diag = np.clip(np.diag(cov_trans), 0, None)
+                self.last_pose_std_m = float(np.sqrt(np.mean(diag)))
+            except np.linalg.LinAlgError:
+                self.last_pose_std_m = 0.0
 
         final_c2w = torch.inverse(torch.from_numpy(reference_w2c) @ best_w2c)
         final_c2w[-1, :] = torch.tensor([0., 0., 0., 1.], dtype=final_c2w.dtype, device=final_c2w.device)

@@ -97,6 +97,24 @@ def viewpoint_localizer(viewpoint, gaussians, base_lr: float=1e-3):
     
     return converged, rel_tsfm, loss_residual, loss_log
 
+def _farthest_point_sample(pts: torch.Tensor, n_samples: int) -> torch.Tensor:
+    """Greedy farthest-point sampling on GPU. Returns indices into pts.
+
+    Keeps everything on-device (no .item() syncs) so the loop stays fast.
+    """
+    N = pts.shape[0]
+    device = pts.device
+    selected = torch.zeros(n_samples, dtype=torch.long, device=device)
+    distances = torch.full((N,), float('inf'), device=device)
+    selected[0] = torch.randint(0, N, (1,), device=device)[0]
+    for i in range(1, n_samples):
+        last = pts[selected[i - 1]]
+        d = ((pts - last) ** 2).sum(-1)
+        distances = torch.minimum(distances, d)
+        selected[i] = torch.argmax(distances)
+    return selected
+
+
 def gaussian_registration(src_dict, tgt_dict, config: dict, visualize=False):
     """_summary_
 
@@ -122,6 +140,30 @@ def gaussian_registration(src_dict, tgt_dict, config: dict, visualize=False):
     
     src_3dgs, src_view_list = copy.deepcopy(src_dict['gaussians']), copy.deepcopy(src_dict['cameras'])
     tgt_3dgs, tgt_view_list = copy.deepcopy(tgt_dict['gaussians']), copy.deepcopy(tgt_dict['cameras'])
+
+    # Subsample Gaussians to speed up registration while keeping geometric diversity.
+    # Two-stage: random prefilter (cheap, O(N)) → FPS (spatially spread, O(M*K)).
+    max_reg_gaussians = config.get("max_reg_gaussians", 50000)
+    for model in (src_3dgs, tgt_3dgs):
+        n = model._xyz.shape[0]
+        if n > max_reg_gaussians:
+            device = model._xyz.device
+            # Stage 1: random prefilter to 3x target (caps FPS cost)
+            pre_n = min(n, 3 * max_reg_gaussians)
+            pre_idx = torch.randperm(n, device=device)[:pre_n]
+            pts = model._xyz[pre_idx].detach()
+            # Stage 2: farthest-point sampling on the prefilter
+            keep_local = _farthest_point_sample(pts, max_reg_gaussians)
+            keep_idx = pre_idx[keep_local]
+            with torch.no_grad():
+                model._xyz = torch.nn.Parameter(model._xyz[keep_idx])
+                model._features_dc = torch.nn.Parameter(model._features_dc[keep_idx])
+                model._features_rest = torch.nn.Parameter(model._features_rest[keep_idx])
+                model._scaling = torch.nn.Parameter(model._scaling[keep_idx])
+                model._rotation = torch.nn.Parameter(model._rotation[keep_idx])
+                model._opacity = torch.nn.Parameter(model._opacity[keep_idx])
+                if hasattr(model, "max_radii2D") and model.max_radii2D.numel() == n:
+                    model.max_radii2D = model.max_radii2D[keep_idx]
     
     # compute gt tsfm
     src_keyframe= src_dict['cameras'][0].get_T.detach()

@@ -60,6 +60,7 @@ class Loop_closure(object):
         self.submap_path = None
         self.pgo_count = 0
         self.n_loop_edges = 0
+        self._reg_cache = {}  # cache: (src_id, tgt_id, method) -> reg_dict
         self.opt = OptimizationParams(ArgumentParser(description="Training script parameters"))
         self.proj_matrix = getProjectionMatrix2(
                 znear=0.01,
@@ -81,6 +82,9 @@ class Loop_closure(object):
         
         self.max_correspondence_distance_coarse = self.config['lc']['voxel_size'] * 15
         self.max_correspondence_distance_fine = self.config['lc']['voxel_size'] * 1.5
+
+        # Skip expensive GT-based analysis (for active/online runs)
+        self.skip_analysis = self.config['lc'].get('skip_analysis', False)
         
     def update_submaps_info(self, keyframes_info):
         """Update the submaps_info with current submap 
@@ -217,7 +221,7 @@ class Loop_closure(object):
             iterator = range(source_id+1, n_submaps) if final else range(source_id)
             for target_id in iterator:
                 if abs(target_id - source_id)== 1: # odometry edge
-                    reg_dict = self.pairwise_registration(submap_list[source_id], submap_list[target_id], "identity")
+                    reg_dict = self._cached_registration(submap_list, source_id, target_id, "identity")
                     transformation = reg_dict['transformation']
                     information = reg_dict['information']
                     pose_graph.edges.append(
@@ -226,24 +230,30 @@ class Loop_closure(object):
                                                                 transformation,
                                                                 information,
                                                                 uncertain=False))
-                    # analyse 
-                    gt_dict = self.pairwise_registration(submap_list[source_id], submap_list[target_id], "gt")
-                    ae = roma.rotmat_geodesic_distance(torch.from_numpy(gt_dict['transformation'][:3,:3]), torch.from_numpy(reg_dict['transformation'][:3, :3])) * 180 /torch.pi
-                    te = np.linalg.norm(gt_dict['transformation'][:3,3] - reg_dict["transformation"][:3,3])
-                    odometry_edges.append((source_id, target_id, ae.item(), te.item()))
+                    if not self.skip_analysis:
+                        # analyse
+                        gt_dict = self.pairwise_registration(submap_list[source_id], submap_list[target_id], "gt")
+                        ae = roma.rotmat_geodesic_distance(torch.from_numpy(gt_dict['transformation'][:3,:3]), torch.from_numpy(reg_dict['transformation'][:3, :3])) * 180 /torch.pi
+                        te = np.linalg.norm(gt_dict['transformation'][:3,3] - reg_dict["transformation"][:3,3])
+                        odometry_edges.append((source_id, target_id, ae.item(), te.item()))
+                    else:
+                        odometry_edges.append((source_id, target_id, 0.0, 0.0))
                     # TODO: update odometry edge with the PGO_edge class
 
                 elif target_id in matches: # loop closure edge
-                    reg_dict = self.pairwise_registration(submap_list[source_id], submap_list[target_id], "gs_reg")
+                    reg_dict = self._cached_registration(submap_list, source_id, target_id, "gs_reg")
                     if not reg_dict['successful']: continue
-                    
+
                     if np.isnan(reg_dict["transformation"][:3,3]).any() or reg_dict["transformation"][3,3]!=1.0: continue
-                    
-                    # analyse 
-                    gt_dict = self.pairwise_registration(submap_list[source_id], submap_list[target_id], "gt")
-                    ae = roma.rotmat_geodesic_distance(torch.from_numpy(reg_dict['transformation'][:3,:3]), torch.from_numpy(gt_dict['transformation'][:3, :3])) * 180 /torch.pi
-                    te = np.linalg.norm(gt_dict['transformation'][:3,3] - reg_dict["transformation"][:3,3])
-                    loop_edges.append((source_id, target_id, ae.item(), te.item()))
+
+                    if not self.skip_analysis:
+                        # analyse
+                        gt_dict = self.pairwise_registration(submap_list[source_id], submap_list[target_id], "gt")
+                        ae = roma.rotmat_geodesic_distance(torch.from_numpy(reg_dict['transformation'][:3,:3]), torch.from_numpy(gt_dict['transformation'][:3, :3])) * 180 /torch.pi
+                        te = np.linalg.norm(gt_dict['transformation'][:3,3] - reg_dict["transformation"][:3,3])
+                        loop_edges.append((source_id, target_id, ae.item(), te.item()))
+                    else:
+                        loop_edges.append((source_id, target_id, 0.0, 0.0))
                     
                     transformation = reg_dict['transformation']
                     information = reg_dict['information']
@@ -305,7 +315,8 @@ class Loop_closure(object):
                     "correct_tsfm": pose_graph.nodes[id].pose}
                 correction_list.append(submap_correction)
                 
-            self.analyse_pgo(odometry_edges, loop_edges, pose_graph)
+            if not self.skip_analysis:
+                self.analyse_pgo(odometry_edges, loop_edges, pose_graph)
         
         else:
             print("No valid loop edges or new loop edges. Skipping ...")
@@ -425,15 +436,56 @@ class Loop_closure(object):
         plt.savefig(plot_filename)
         return
     
-    def submap_to_segment(self, submap):
+    def submap_to_segment(self, submap, max_points: int = 20000):
+        """Convert submap Gaussians to a point cloud for registration.
+
+        Downsample to at most max_points by random subsampling — registration with
+        millions of Gaussians is overkill and a few tens of thousands is plenty.
+        """
+        pts = submap['gaussians'].get_xyz().detach().cpu()
+        if pts.shape[0] > max_points:
+            idx = torch.randperm(pts.shape[0])[:max_points]
+            pts = pts[idx]
         segment = {
-            "points": submap['gaussians'].get_xyz().detach().cpu(),
+            "points": pts,
             "keyframe": submap['cameras'][0].get_T.detach().cpu(),
             "gt_camera": submap['cameras'][0].get_T_gt.detach().cpu(),
         }
         return segment
 
+    def invalidate_reg_cache(self, submap_ids=None):
+        """Clear registration cache. If submap_ids given, only drop entries involving those."""
+        if submap_ids is None:
+            self._reg_cache.clear()
+        else:
+            ids = set(int(i) for i in submap_ids)
+            self._reg_cache = {
+                k: v for k, v in self._reg_cache.items()
+                if k[0] not in ids and k[1] not in ids
+            }
+
+    def _cached_registration(self, submap_list, source_id, target_id, method):
+        """Wrap pairwise_registration with a cross-LC-call cache.
+
+        Submap checkpoints don't change between LC calls (only during LC correction,
+        after which the cache is cleared), so we can reuse registration results.
+        """
+        key = (int(source_id), int(target_id), method)
+        if key in self._reg_cache:
+            return self._reg_cache[key]
+        result = self.pairwise_registration(submap_list[source_id], submap_list[target_id], method)
+        self._reg_cache[key] = result
+        return result
+
     def pairwise_registration(self, submap_source, submap_target, method="gs_reg"):
+
+        # Short-circuit: identity method doesn't need point-cloud preprocessing
+        if method == "identity":
+            output = dict()
+            output["transformation"] = np.identity(4)
+            output["information"] = np.identity(6)
+            output["successful"] = True
+            return output
 
         segment_source = self.submap_to_segment(submap_source)
         segment_target = self.submap_to_segment(submap_target)
