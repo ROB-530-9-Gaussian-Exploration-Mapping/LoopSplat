@@ -217,7 +217,13 @@ class Loop_closure(object):
         odometry_edges, loop_edges = [], []
         new_submap_valid_loop = False
         for source_id in tqdm(reversed(range(1, n_submaps))):
-            matches = self.detect_closure(source_id, final)
+            # Incremental LC: only the newest submap needs fresh hloc matches.
+            # Older pair matches were already evaluated in prior LC calls.
+            # Final LC (final=True) still does the full pass.
+            if final or source_id == n_submaps - 1:
+                matches = self.detect_closure(source_id, final)
+            else:
+                matches = []
             iterator = range(source_id+1, n_submaps) if final else range(source_id)
             for target_id in iterator:
                 if abs(target_id - source_id)== 1: # odometry edge
