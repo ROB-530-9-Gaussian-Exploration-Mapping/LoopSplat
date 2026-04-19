@@ -6,7 +6,7 @@ import open3d.core as o3c
 
 class VisualOdometer(object):
 
-    def __init__(self, intrinsics: np.ndarray, method_name="hybrid", device="cuda"):
+    def __init__(self, intrinsics: np.ndarray, method_name="hybrid", device="cpu"):
         """ Initializes the visual odometry system with specified intrinsics, method, and device.
         Args:
             intrinsics: Camera intrinsic parameters.
