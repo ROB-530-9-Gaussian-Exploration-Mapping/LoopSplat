@@ -168,6 +168,8 @@ class Loop_closure(object):
         query_info = self.submap_lc_info[query_id]
         iterator = range(query_id+1, n_submaps) if final else range(query_id)
         db_info_list = [self.submap_lc_info[i] for i in iterator]
+        if not db_info_list:
+            return torch.tensor([], dtype=torch.long, device=self.device)
         db_desc_map_id = []
         for db_info in db_info_list:
             db_desc_map_id += [db_info['submap_id'] for _ in db_info['kf_desc']]
